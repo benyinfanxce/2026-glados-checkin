@@ -14,8 +14,8 @@
 import requests
 import json
 import os
+import re
 import sys
-import time
 from datetime import datetime
 
 # Fix Windows Unicode Output
@@ -42,6 +42,39 @@ HEADERS = {
 def log(msg):
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{ts}] {msg}")
+
+def mask_email(email):
+    """Mask account identifiers before writing them to public Actions logs."""
+    if not email or '@' not in email:
+        return "***"
+    local, domain = email.split('@', 1)
+    visible = local[:2] if len(local) > 2 else local[:1]
+    return f"{visible}***@{domain}"
+
+def checkin_succeeded(response):
+    """Recognize both a fresh check-in and an already-completed check-in."""
+    if not isinstance(response, dict):
+        return False
+
+    message = str(response.get('message', '')).strip().lower()
+    failure_markers = (
+        'please checkin via',
+        'failure',
+        'failed',
+        'invalid',
+        'expired',
+        'network error',
+    )
+    if not message or any(marker in message for marker in failure_markers):
+        return False
+
+    success_markers = (
+        'checkin',
+        'observation logged',
+        'try tomorrow',
+        'already checked',
+    )
+    return any(marker in message for marker in success_markers)
 
 def extract_cookie(raw: str):
     """提取 Cookie，支持 Cookie-Editor 冒号格式"""
@@ -159,18 +192,28 @@ class GLaDOS:
 # ================= 主程序 =================
 
 def pushplus(token, title, content):
-    if not token: return
+    if not token:
+        return False
     try:
-        url = "http://www.pushplus.plus/send"
-        requests.get(url, params={'token': token, 'title': title, 'content': content, 'template': 'html'}, timeout=5)
+        url = "https://www.pushplus.plus/send"
+        resp = requests.get(
+            url,
+            params={'token': token, 'title': title, 'content': content, 'template': 'html'},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        payload = resp.json()
+        if payload.get('code') != 200:
+            raise RuntimeError(payload.get('msg', 'PushPlus rejected the message'))
         log("✅ PushPlus 推送成功")
-    except:
-        log("❌ PushPlus 推送失败")
+        return True
+    except Exception as e:
+        log(f"❌ PushPlus 推送失败: {e}")
+        return False
 
 def telegram_push(token, chat_id, title, content):
     if not token or not chat_id: return
     try:
-        import re
         url = f"https://api.telegram.org/bot{token}/sendMessage"
         # Convert HTML to be Telegram-compatible
         text = f"<b>{title}</b>\n\n{content}"
@@ -204,7 +247,6 @@ def telegram_push(token, chat_id, title, content):
             "text": text,
             "parse_mode": "HTML"
         }
-        log(f"发送内容: {data}")
         resp=requests.post(url, json=data, timeout=5)
         if resp.status_code != 200:
             log(f"❌ Telegram 推送失败: {resp.json()}")
@@ -216,7 +258,8 @@ def telegram_push(token, chat_id, title, content):
 def main():
     log("🚀 2026 GLaDOS Checkin Starting...")
     cookies = get_cookies()
-    if not cookies: sys.exit(1)
+    if not cookies:
+        return 1
     
     results = []
     success_cnt = 0
@@ -227,16 +270,18 @@ def main():
         # 1. Checkin
         res = g.checkin()
         msg = res.get('message', 'Failure') if res else "Network Error"
+        succeeded = checkin_succeeded(res)
         
         # 2. Get Info (Refresh data)
         g.get_status()
         g.get_points()
         
         # 3. Log
-        status_icon = "✅" if "Checkin" in msg else "⚠️"
-        log(f"用户: {g.email} | 积分: {g.points} | 天数: {g.left_days} | 结果: {msg}")
+        status_icon = "✅" if succeeded else "❌"
+        log(f"{status_icon} 用户: {mask_email(g.email)} | 积分: {g.points} | 天数: {g.left_days} | 结果: {msg}")
         
-        if "Checkin" in msg: success_cnt += 1
+        if succeeded:
+            success_cnt += 1
         
         # 4. Result Formatting
         results.append(f"""
@@ -258,7 +303,7 @@ def main():
     
     if push_level == "fail_only" and success_cnt == len(cookies):
         log("⏭️ 根据 PUSH_LEVEL=fail_only 设置，所有账号签到成功，跳过推送")
-        return
+        return 0
 
     ptoken = os.environ.get("PUSHPLUS_TOKEN")
     tg_token = os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -274,5 +319,12 @@ def main():
         if tg_token and tg_chat_id:
             telegram_push(tg_token, tg_chat_id, title, content)
 
+    if success_cnt != len(cookies):
+        log(f"❌ 签到失败: 成功 {success_cnt}/{len(cookies)}")
+        return 1
+
+    log(f"✅ 签到完成: 成功 {success_cnt}/{len(cookies)}")
+    return 0
+
 if __name__ == '__main__':
-    main()
+    sys.exit(main())
